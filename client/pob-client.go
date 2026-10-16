@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,10 +77,17 @@ var pobShareSites = []pobShareSite{
 	{"poedb.tw", regexp.MustCompile(`^https://poedb\.tw/pob/([^/?#\s]+)`), "https://poedb.tw/pob/%s/raw"},
 }
 
+var ninjaBaseURL = "https://poe.ninja/poe1"
+
+var ninjaCharacterPage = regexp.MustCompile(`^https://poe\.ninja/(?:poe1/)?builds/([^/?#]+)/character/([^/?#]+)/([^/?#]+)`)
+
 // FetchPoBFromShareLink resolves a share link from one of the sites Path of
 // Building supports importing from (see pobShareSites) into its raw PoB
 // export code. Returns an error if the link doesn't match any known site.
 func FetchPoBFromShareLink(shareURL string) (string, error) {
+	if match := ninjaCharacterPage.FindStringSubmatch(shareURL); match != nil {
+		return fetchNinjaCharacterPoB(shareURL, match[1], match[2], match[3])
+	}
 	for _, site := range pobShareSites {
 		match := site.matchURL.FindStringSubmatch(shareURL)
 		if match == nil {
@@ -105,6 +114,82 @@ func FetchPoBFromShareLink(shareURL string) (string, error) {
 		return strings.TrimSpace(string(body)), nil
 	}
 	return "", fmt.Errorf("unrecognized PoB share link")
+}
+
+type ninjaSnapshot struct {
+	URL          string `json:"url"`
+	Type         string `json:"type"`
+	Version      string `json:"version"`
+	SnapshotName string `json:"snapshotName"`
+	OverviewType int    `json:"overviewType"`
+}
+
+func fetchNinjaCharacterPoB(pageURL, league, account, name string) (string, error) {
+	account, err := url.PathUnescape(account)
+	if err != nil {
+		return "", fmt.Errorf("invalid account in poe.ninja link: %v", err)
+	}
+	name, err = url.PathUnescape(name)
+	if err != nil {
+		return "", fmt.Errorf("invalid character name in poe.ninja link: %v", err)
+	}
+
+	var index struct {
+		SnapshotVersions []*ninjaSnapshot `json:"snapshotVersions"`
+	}
+	if err := getNinjaJSON(ninjaBaseURL+"/api/data/index-state", &index); err != nil {
+		return "", err
+	}
+	snapshot, found := utils.FindFirst(index.SnapshotVersions, func(s *ninjaSnapshot) bool {
+		return s.URL == league && s.Type == "exp"
+	})
+	if !found {
+		return "", fmt.Errorf("poe.ninja has no builds for league %q", league)
+	}
+
+	query := url.Values{
+		"account":  {account},
+		"name":     {name},
+		"overview": {snapshot.SnapshotName},
+		"type":     {strconv.Itoa(snapshot.OverviewType)},
+	}
+	if parsed, err := url.Parse(pageURL); err == nil {
+		if timeMachine := parsed.Query().Get("timemachine"); timeMachine != "" {
+			query.Set("timeMachine", timeMachine)
+		}
+	}
+
+	var character struct {
+		PathOfBuildingExport string `json:"pathOfBuildingExport"`
+	}
+	characterURL := fmt.Sprintf("%s/api/builds/%s/character?%s", ninjaBaseURL, url.PathEscape(snapshot.Version), query.Encode())
+	if err := getNinjaJSON(characterURL, &character); err != nil {
+		return "", err
+	}
+	if character.PathOfBuildingExport == "" {
+		return "", fmt.Errorf("poe.ninja has no PoB export for this character")
+	}
+	return character.PathOfBuildingExport, nil
+}
+
+func getNinjaJSON(requestURL string, target any) error {
+	request, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+	request.Header.Set("User-Agent", "bpl-pob-import")
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("failed to fetch from poe.ninja: %v", err)
+	}
+	defer utils.Closer(response.Body)()
+	if response.StatusCode != 200 {
+		return fmt.Errorf("poe.ninja returned status %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(target); err != nil {
+		return fmt.Errorf("failed to decode poe.ninja response: %v", err)
+	}
+	return nil
 }
 
 func UpdatePoBExport(pobString string) (string, error) {
